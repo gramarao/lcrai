@@ -1,0 +1,238 @@
+import google.generativeai as genai
+from vertexai.language_models import TextEmbeddingModel
+import vertexai
+from typing import List, Dict, AsyncGenerator
+from google.cloud import storage
+import PyPDF2
+from io import BytesIO
+from sqlalchemy import text
+from app.models.database import SessionLocal, Document, DocumentChunk
+from config.settings import settings
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+class RAGService:
+    def __init__(self):
+        # Initialize Vertex AI for embeddings only
+        vertexai.init(project=settings.GCP_PROJECT_ID, location="us-central1")
+        self.embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+        
+        # Initialize Google AI for Gemini (set API key as environment variable)
+        api_key = os.getenv("GOOGLE_AI_API_KEY")  # We'll set this
+        if not api_key:
+            raise Exception("GOOGLE_AI_API_KEY environment variable not set")
+        
+        genai.configure(api_key=api_key)
+        self.llm_model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        self.storage_client = storage.Client()
+        self.bucket = self.storage_client.bucket(f"{settings.GCP_PROJECT_ID}-docs")
+    
+    def process_pdf(self, file_content: bytes, filename: str) -> str:
+        """Extract text from PDF"""
+        try:
+            pdf_reader = PyPDF2.PdfReader(BytesIO(file_content))
+            text = "\n".join([page.extract_text() for page in pdf_reader.pages])
+            return text.strip()
+        except Exception as e:
+            raise Exception(f"PDF processing failed: {e}")
+    
+    def chunk_text(self, text: str, chunk_size: int = 1000) -> list:
+        """Split text into chunks"""
+        words = text.split()
+        chunks = []
+        for i in range(0, len(words), chunk_size):
+            chunk = " ".join(words[i:i + chunk_size])
+            chunks.append(chunk)
+        return chunks
+    
+    def store_document(self, filename: str, file_content: bytes) -> str:
+        """Process and store document"""
+        db = SessionLocal()
+        try:
+            # Extract text
+            text = self.process_pdf(file_content, filename)
+            if not text:
+                raise Exception("No text extracted")
+            
+            # Store document
+            doc = Document(filename=filename, content=text)
+            db.add(doc)
+            db.flush()
+            
+            # Create chunks and embeddings
+            chunks = self.chunk_text(text)
+            
+            # Process in smaller batches
+            batch_size = 5
+            for i in range(0, len(chunks), batch_size):
+                batch_chunks = chunks[i:i + batch_size]
+                batch_embeddings = self.embedding_model.get_embeddings(batch_chunks)
+                
+                for j, (chunk_text, embedding) in enumerate(zip(batch_chunks, batch_embeddings)):
+                    chunk = Chunk(
+                        document_id=doc.id,
+                        content=chunk_text,
+                        embedding=embedding.values,
+                        chunk_index=i + j
+                    )
+                    db.add(chunk)
+            
+            db.commit()
+            logger.info(f"Stored {filename} with {len(chunks)} chunks")
+            return str(doc.id)
+            
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error storing document: {e}")
+            raise e
+        finally:
+            db.close()
+    
+    async def search_and_generate(self, question: str) -> dict:
+        """Search similar content and generate response"""
+        db = SessionLocal()
+        try:
+            # Get question embedding
+            question_embedding = self.embedding_model.get_embeddings([question])[0].values
+            
+            # Search similar chunks
+            query = text("""
+                SELECT content
+                FROM chunks 
+                ORDER BY embedding <-> :embedding 
+                LIMIT 3
+            """)
+            
+            results = db.execute(query, {"embedding": str(question_embedding)}).fetchall()
+            
+            if not results:
+                return {
+                    "answer": "I couldn't find relevant information in the uploaded documents.",
+                    "sources": []
+                }
+            
+            # Create context
+            context = "\n\n".join([r.content for r in results])
+            
+            # Generate response using Google AI Gemini
+            prompt = f"""Based on the following context from uploaded documents, please answer the question accurately and concisely.
+
+Context:
+{context}
+
+Question: {question}
+
+Please provide a helpful answer based only on the information in the context."""
+
+            try:
+                response = self.llm_model.generate_content(prompt)
+                answer_text = response.text
+            except Exception as e:
+                logger.error(f"Gemini generation failed: {e}")
+                answer_text = f"I found relevant information but couldn't generate a response. Please try rephrasing your question."
+            
+            return {
+                "answer": answer_text,
+                "sources": [{"content": r.content[:200] + "..."} for r in results]
+            }
+            
+        except Exception as e:
+            logger.error(f"Search error: {e}")
+            return {
+                "answer": f"Sorry, there was an error processing your question: {str(e)}",
+                "sources": []
+            }
+        finally:
+            db.close()
+
+    async def stream_search_and_generate(self, question: str, max_sources: int = 3, doc_ids: list = None) -> AsyncGenerator[Dict, None]:
+        """Streaming search and generate"""
+        try:
+            start_time = time.time()
+            logger.debug(f"Streaming query: {question[:50]}... with doc_ids: {doc_ids}")
+            
+            yield {
+                "type": "metadata",
+                "question": question,
+                "timestamp": datetime.now().isoformat(),
+                "status": "starting"
+            }
+            
+            question_embedding = self.embedding_model.get_embeddings([question])[0].values
+            search_results = self._vector_search(question_embedding, limit=max_sources, doc_ids=doc_ids)
+            
+            if not search_results:
+                logger.warning("No search results found for streaming")
+                yield {
+                    "type": "complete",
+                    "full_response": "No relevant information found in the selected documents.",
+                    "sources": [],
+                    "response_time": time.time() - start_time,
+                    "tokens_used": 0,
+                    "is_complete": True
+                }
+                yield {
+                    "type": "stream_end",
+                    "timestamp": datetime.now().isoformat()
+                }
+                return
+            
+            context = "\n\n".join(
+                f"[Source: {result['filename']} (Chunk {result['chunk_index']})]\n{result['content'][:500]}"
+                for result in search_results
+            )
+            
+            prompt = f"""Answer based on the context below. If the context doesn't contain enough information, say so.
+CONTEXT: {context}
+QUESTION: {question}
+ANSWER:"""
+            
+            response_stream = self.llm_model.predict_streaming(
+                prompt,
+                max_output_tokens=800,
+                temperature=0.1
+            )
+            
+            full_response = ""
+            chunk_count = 0
+            for chunk in response_stream:
+                if hasattr(chunk, 'text') and chunk.text:
+                    full_response += chunk.text
+                    chunk_count += 1
+                    yield {
+                        "type": "content",
+                        "chunk": chunk.text,
+                        "chunk_num": chunk_count,
+                        "timestamp": datetime.now().isoformat()
+                    }
+            
+            tokens_used = response_stream._raw_response.usage_metadata.total_token_count if hasattr(response_stream._raw_response, 'usage_metadata') else 0
+            yield {
+                "type": "complete",
+                "full_response": full_response,
+                "sources": search_results,
+                "response_time": time.time() - start_time,
+                "tokens_used": tokens_used,
+                "chunk_count": chunk_count,
+                "is_complete": True
+            }
+            yield {
+                "type": "stream_end",
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Stream failed: {str(e)}")
+            yield {
+                "type": "error",
+                "message": f"Stream failed: {str(e)}",
+                "is_complete": True
+            }
+            yield {
+                "type": "stream_end",
+                "timestamp": datetime.now().isoformat()
+            }
+
+rag_service = RAGService()
