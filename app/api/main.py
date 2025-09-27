@@ -3,16 +3,26 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import text
 from sqlalchemy.exc import SQLAlchemyError
-from app.models.database import Document, DocumentChunk, get_db
+from app.models.database import Document, DocumentChunk, UserFeedback, FeedbackSource, get_db
 import logging
 import time
 from datetime import datetime
 from app.services.rag_service_googleai import rag_service
 import json
+import uuid
 
-# Initialize FastAPI app
 app = FastAPI(title="RAG Application")
 router = APIRouter()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/streamlit_app.log', mode='a'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 start_time = time.time()
 
@@ -51,7 +61,7 @@ async def get_documents(db: Session = Depends(get_db)):
                 "id": str(doc.id),  # Convert UUID to string
                 "filename": doc.filename,
                 "created_at": doc.created_at.isoformat(),
-                "content_length": len(doc.content or "")  # Add content length
+                "content_length": len(doc.content or "")
             } for doc in documents
         ]
     except Exception as e:
@@ -106,7 +116,7 @@ async def query_stream(payload: dict, db: Session = Depends(get_db)):
             if not question:
                 raise HTTPException(status_code=400, detail="Question is required")
             async for chunk in rag_service.stream_search_and_generate(question, max_sources=3, doc_ids=doc_ids):
-                yield json.dumps(chunk) + "\n"  # Add newline for streaming
+                yield json.dumps(chunk) + "\n"
         except Exception as e:
             logger.error(f"Streaming query failed: {str(e)}")
             error_chunk = {"type": "error", "message": f"Stream failed: {str(e)}", "is_complete": True}
@@ -115,5 +125,58 @@ async def query_stream(payload: dict, db: Session = Depends(get_db)):
 
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
-# Include router in the app
+@router.post("/feedback")
+async def submit_feedback(payload: dict, db: Session = Depends(get_db)):
+    logger.info("Entering feedback post")
+    try:
+        feedback = UserFeedback(
+            id=payload.get("id", str(uuid.uuid4())),
+            session_id=payload["session_id"],
+            query_id=payload["query_id"],
+            question=payload["question"],
+            response=payload["response"],
+            rating=payload.get("rating"),
+            thumbs_up=payload.get("thumbs_up"),
+            feedback_text=payload.get("feedback_text"),
+            response_time=payload.get("response_time"),
+            tokens_used=payload.get("tokens_used"),
+            sources_count=payload.get("sources_count"),
+            created_at=datetime.now()
+        )
+        logger.info("feedback obj created from post")
+        db.add(feedback)
+        db.flush()
+        logger.info("feedback added, now onto feedback_sources")
+        for source in payload.get("sources", []):
+            feedback_source = FeedbackSource(
+                feedback_id=feedback.id,
+                document_id=source["document_id"],
+                chunk_id=source["chunk_id"],
+                relevance_score=source.get("relevance_score", 0.0)
+            )
+            db.add(feedback_source)
+        db.commit()
+        logger.info(f"Feedback stored: query_id={payload['query_id']}")
+        return {"message": "Feedback submitted successfully"}
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to store feedback: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to store feedback: {str(e)}")
+
+@router.get("/feedback_stats")
+async def feedback_stats(db: Session = Depends(get_db)):
+    try:
+        result = db.execute(text("""
+            SELECT 
+                AVG(rating) as avg_rating,
+                SUM(CASE WHEN thumbs_up THEN 1 ELSE 0 END)::float / COUNT(*) as positive_ratio
+            FROM user_feedback
+            WHERE rating IS NOT NULL
+        """)).first()
+        avg_rating, positive_ratio = result if result else (0.0, 0.0)
+        return {"avg_rating": avg_rating or 0.0, "positive_ratio": positive_ratio or 0.0}
+    except Exception as e:
+        logger.error(f"Failed to fetch feedback stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch feedback stats: {str(e)}")
+
 app.include_router(router, prefix="/api")

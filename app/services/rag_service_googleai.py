@@ -32,7 +32,8 @@ class RAGService:
                 DocumentChunk.content,
                 Document.filename,
                 DocumentChunk.chunk_index,
-                DocumentChunk.id.label('chunk_id')
+                DocumentChunk.id.label('chunk_id'),
+                Document.id.label('document_id')  # Add document_id
             ).join(
                 Document, Document.id == DocumentChunk.document_id
             ).order_by(
@@ -43,7 +44,8 @@ class RAGService:
             results = query.limit(limit).all()
             search_results = [
                 {
-                    "id": str(row.chunk_id),  # Convert UUID to string
+                    "id": str(row.chunk_id),  # Chunk ID
+                    "document_id": str(row.document_id),  # Document ID
                     "content": row.content,
                     "filename": row.filename or "Unknown",
                     "chunk_index": row.chunk_index
@@ -193,7 +195,7 @@ ANSWER:"""
                     content=chunk_text,
                     embedding=embedding_result.values,
                     chunk_index=i,
-                    metadata={"filename": filename, "chunk_range": f"{i}-{i+len(chunk_text.split())}"}
+                    doc_metadata={"filename": filename, "chunk_range": f"{i}-{i+len(chunk_text.split())}"}
                 )
                 db.add(chunk)
             db.commit()

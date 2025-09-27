@@ -24,9 +24,11 @@ logger = logging.getLogger(__name__)
 
 st.set_page_config(layout="wide", page_title="RAG Application", initial_sidebar_state="expanded")
 
-# Initialize session state
+# Initialize session state with stable IDs
 if 'api_url' not in st.session_state:
     st.session_state.api_url = "http://localhost:8000/api"
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 if 'uploaded_docs' not in st.session_state:
     st.session_state.uploaded_docs = []
 if 'chat_history' not in st.session_state:
@@ -41,6 +43,8 @@ if 'query_stats' not in st.session_state:
     st.session_state.query_stats = {'times': [], 'doc_hits': Counter(), 'total_tokens': 0}
 if 'current_sources' not in st.session_state:
     st.session_state.current_sources = []
+if 'current_query_id' not in st.session_state:
+    st.session_state.current_query_id = None
 
 # Helper functions
 def fetch_documents():
@@ -63,7 +67,7 @@ def upload_document(file):
     logger.debug(f"Entering upload_document: {file.name}")
     try:
         files = {"file": (file.name, BytesIO(file.read()), file.type)}
-        response = requests.post(f"{st.session_state.api_url}/documents/upload", files=files, timeout=30)
+        response = requests.post(f"{st.session_state.api_url}/documents/upload", files=files, timeout=120)
         response.raise_for_status()
         doc_id = response.json().get("document_id")
         logger.info(f"Uploaded document: {file.name}, ID: {doc_id}")
@@ -89,10 +93,15 @@ def delete_document(doc_id):
     finally:
         logger.debug("Exiting delete_document")
 
-# Validate sources before feedback submission
+# FIXED: Handle 'id' from /api/query_stream and output 'chunk_id' for /api/feedback
 def validate_sources(sources):
-    logger.info(f"Validating sources: {json.dumps(sources, indent=2)}")
+    logger.info(f"Validating sources: {json.dumps(sources, indent=2) if sources else 'None'}")
     valid_sources = []
+    
+    if not sources:
+        logger.warning("No sources provided for validation")
+        return valid_sources
+    
     for source in sources:
         if not isinstance(source, dict):
             logger.error(f"Invalid source format: {source}")
@@ -100,19 +109,36 @@ def validate_sources(sources):
         if 'document_id' not in source or 'id' not in source:
             logger.error(f"Missing document_id or id in source: {source}")
             continue
+        
         try:
-            document_id = str(uuid.UUID(source['document_id']))
-            chunk_id = str(uuid.UUID(source['id']))
+            doc_id = str(source['document_id'])
+            chunk_id = str(source['id'])  # Expect 'id' from /api/query_stream
+            
+            # Optional UUID normalization
+            try:
+                doc_id = str(uuid.UUID(doc_id))
+            except ValueError:
+                logger.debug(f"document_id is not a valid UUID, keeping as string: {doc_id}")
+            
+            try:
+                chunk_id = str(uuid.UUID(chunk_id))
+            except ValueError:
+                logger.debug(f"chunk id is not a valid UUID, keeping as string: {chunk_id}")
+            
             valid_sources.append({
-                "document_id": document_id,
-                "chunk_id": chunk_id,
-                "relevance_score": source.get("relevance_score", 1.0)
+                "document_id": doc_id,
+                "chunk_id": chunk_id,  # Output 'chunk_id' for /api/feedback
+                "relevance_score": source.get("relevance_score", 1.0),
+                "filename": source.get("filename", ""),
+                "chunk_index": source.get("chunk_index", 0)
             })
-            logger.info(f"Validated source: document_id={document_id}, chunk_id={chunk_id}")
-        except ValueError as e:
-            logger.error(f"Invalid UUID in source: {source}, error: {str(e)}")
+            logger.debug(f"Validated source: document_id={doc_id}, chunk_id={chunk_id}")
+            
+        except Exception as e:
+            logger.error(f"Error processing source {source}: {str(e)}")
             continue
-    logger.info(f"Valid sources after validation: {json.dumps(valid_sources, indent=2)}")
+    
+    logger.info(f"Valid sources after validation: {len(valid_sources)} sources")
     return valid_sources
 
 # Page navigation
@@ -124,30 +150,25 @@ if page == "Chat":
     st.markdown("Ask questions based on uploaded documents.")
     logger.debug("Chat page loaded")
 
+    # Debug info
+    st.sidebar.text(f"Session ID: {st.session_state.session_id[:8]}...")
+    
     # Debug button to log session state
-    if st.button("Debug Session State"):
-        logger.debug(f"Session state: {json.dumps(dict(st.session_state), indent=2)}")
-
-    # Standalone test form
-    st.markdown("**Test Feedback Form**")
-    with st.form("test_feedback_form"):
-        st.write("This is a test form to verify form functionality.")
-        test_submit = st.form_submit_button("Test Submit")
-        if test_submit:
-            logger.info("Test feedback form submitted successfully")
-            st.success("Test form submitted!")
+    if st.sidebar.button("Debug Session State"):
+        logger.debug(f"Session state keys: {list(st.session_state.keys())}")
+        st.sidebar.success("Session state logged")
 
     # Display chat history
-    for message in st.session_state.chat_history:
+    for i, message in enumerate(st.session_state.chat_history):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message["role"] == "assistant" and message.get("sources"):
                 with st.expander("Sources"):
                     for source in message["sources"]:
                         st.write(f"- **Document ID**: {source['document_id']}")
-                        st.write(f"  **Chunk ID**: {source['chunk_id']}")
-                        st.write(f"  **File**: {source['filename']} (Chunk {source['chunk_index']})")
-                        st.write(f"  **Content**: {source['content'][:300]}...")
+                        st.write(f"  **Chunk ID**: {source['id']}")  # FIXED: Use 'id' from /api/query_stream
+                        st.write(f"  **File**: {source.get('filename', 'Unknown')} (Chunk {source.get('chunk_index', 'N/A')})")
+                        st.write(f"  **Content**: {source.get('content', 'No content')[:300]}...")
                 st.caption(f"Response Time: {message.get('response_time', 0):.2f}s, Tokens Used: {message.get('tokens_used', 0)}")
 
     # Document selection
@@ -160,6 +181,8 @@ if page == "Chat":
     # Chat input
     question = st.chat_input("Ask a question")
     if question:
+        # Generate stable query ID
+        st.session_state.current_query_id = str(uuid.uuid4())
         logger.info(f"Processing query: {question[:50]}...")
         st.session_state.current_question = question
         st.session_state.chat_history.append({"role": "user", "content": question})
@@ -169,9 +192,14 @@ if page == "Chat":
             response_container = st.empty()
             logger.debug("Starting query stream")
             try:
-                payload = {"question": question, "doc_ids": [str(doc_id) for doc_id in st.session_state.selected_doc_ids]}
+                payload = {
+                    "question": question,
+                    "doc_ids": [str(doc_id) for doc_id in st.session_state.selected_doc_ids],
+                    "query_id": st.session_state.current_query_id,
+                    "session_id": st.session_state.session_id
+                }
                 logger.info(f"Sending query to /api/query_stream with payload: {json.dumps(payload, indent=2)}")
-                with requests.post(f"{st.session_state.api_url}/query_stream", json=payload, stream=True, timeout=30) as response:
+                with requests.post(f"{st.session_state.api_url}/query_stream", json=payload, stream=True, timeout=120) as response:
                     response.raise_for_status()
                     logger.debug("Query stream response started")
                     for line in response.iter_lines():
@@ -184,7 +212,7 @@ if page == "Chat":
                             elif chunk["type"] == "complete":
                                 st.session_state.current_sources = chunk.get("sources", [])
                                 logger.info(f"Query completed, received {len(st.session_state.current_sources)} sources")
-                                logger.info(f"Sources received: {json.dumps(st.session_state.current_sources, indent=2)}")
+                                logger.debug(f"Sources received: {json.dumps(st.session_state.current_sources, indent=2)}")
                                 st.session_state.query_stats['times'].append(chunk["response_time"])
                                 st.session_state.query_stats['total_tokens'] += chunk["tokens_used"]
                                 for source in st.session_state.current_sources:
@@ -192,18 +220,22 @@ if page == "Chat":
                                 st.session_state.chat_history.append({
                                     "role": "assistant",
                                     "content": st.session_state.current_response,
+                                    "question": st.session_state.current_question,  # Add this
                                     "sources": st.session_state.current_sources,
                                     "response_time": chunk["response_time"],
-                                    "tokens_used": chunk["tokens_used"]
+                                    "tokens_used": chunk["tokens_used"],
+                                    "query_id": st.session_state.current_query_id,
+                                    "completed": True,
+                                    "feedback_submitted": False
                                 })
-                                # Display detailed response
+                                # Display response
                                 st.markdown("**Full Response**:")
                                 st.markdown(st.session_state.current_response)
                                 if st.session_state.current_sources:
                                     st.markdown("**Sources**:")
                                     for source in st.session_state.current_sources:
                                         st.write(f"- **Document ID**: {source['document_id']}")
-                                        st.write(f"  **Chunk ID**: {source['chunk_id']}")
+                                        st.write(f"  **Chunk ID**: {source['id']}")  # FIXED: Use 'id' from /api/query_stream
                                         st.write(f"  **File**: {source['filename']} (Chunk {source['chunk_index']})")
                                         st.write(f"  **Content**: {source['content'][:300]}...")
                                 else:
@@ -218,50 +250,59 @@ if page == "Chat":
                 logger.error(f"Streaming query failed: {str(e)}")
             logger.debug("Query stream completed")
 
-        # Render feedback form outside try-except
-        logger.info("Rendering feedback form")
-        try:
-            with st.form(f"feedback_{len(st.session_state.chat_history)}_{uuid.uuid4()}"):
+    # Render feedback form only for the last completed assistant message
+    if st.session_state.chat_history:
+        last_msg = st.session_state.chat_history[-1]
+        if (last_msg.get("role") == "assistant" and 
+            last_msg.get("completed") and 
+            last_msg.get("query_id") and
+            not last_msg.get("feedback_submitted")):
+            form_key = f"feedback_{last_msg['query_id']}"
+            logger.info(f"Rendering feedback form with key: {form_key}")
+            with st.form(form_key):
                 st.markdown("**Provide Feedback**")
-                rating = st.slider("Rate this response (1-5)", 1, 5, 3, key=f"rating_{len(st.session_state.chat_history)}_{uuid.uuid4()}")
-                thumbs_up = st.checkbox("Thumbs Up", key=f"thumbs_{len(st.session_state.chat_history)}_{uuid.uuid4()}")
-                feedback_text = st.text_area("Comments (optional)", key=f"comment_{len(st.session_state.chat_history)}_{uuid.uuid4()}")
+                rating = st.slider("Rate this response (1-5)", 1, 5, 3, key=f"rating_{form_key}")
+                thumbs_up = st.checkbox("Thumbs Up", key=f"thumbs_{form_key}")
+                feedback_text = st.text_area("Comments (optional)", key=f"comment_{form_key}")
                 submitted = st.form_submit_button("Submit Feedback")
-                logger.info("Feedback form rendered")
                 if submitted:
                     logger.info("Feedback form submitted")
                     try:
-                        valid_sources = validate_sources(st.session_state.current_sources)
+                        valid_sources = validate_sources(last_msg.get("sources", []))
                         feedback_payload = {
-                            "session_id": str(uuid.uuid4()),
-                            "query_id": str(uuid.uuid4()),
+                            "session_id": st.session_state.session_id,
+                            "query_id": last_msg["query_id"],
                             "question": st.session_state.current_question,
-                            "response": st.session_state.current_response,
+                            "response": last_msg.get("content", ""),
                             "rating": rating,
                             "thumbs_up": thumbs_up,
                             "feedback_text": feedback_text,
-                            "response_time": st.session_state.chat_history[-1].get("response_time", 0.0),
-                            "tokens_used": st.session_state.chat_history[-1].get("tokens_used", 0),
+                            "response_time": last_msg.get("response_time", 0.0),
+                            "tokens_used": last_msg.get("tokens_used", 0),
                             "sources_count": len(valid_sources),
                             "sources": valid_sources
                         }
                         logger.info(f"Feedback payload: {json.dumps(feedback_payload, indent=2)}")
-                        response = requests.post(f"{st.session_state.api_url}/feedback", json=feedback_payload, timeout=10)
-                        response.raise_for_status()
+                        feedback_response = requests.post(
+                            f"{st.session_state.api_url}/feedback", 
+                            json=feedback_payload, 
+                            timeout=10
+                        )
+                        feedback_response.raise_for_status()
                         st.success("Feedback submitted successfully!")
                         logger.info("Feedback submitted successfully")
+                        last_msg["feedback_submitted"] = True
                     except requests.exceptions.HTTPError as e:
-                        error_detail = response.json().get('detail', str(e))
+                        err_resp = e.response
+                        try:
+                            error_detail = err_resp.json().get('detail', err_resp.text) if err_resp else str(e)
+                        except Exception:
+                            error_detail = err_resp.text if err_resp else str(e)
                         st.error(f"Failed to submit feedback: {error_detail}")
                         logger.error(f"Feedback submission failed: {error_detail}")
                     except Exception as e:
                         st.error(f"Failed to submit feedback: {str(e)}")
                         logger.error(f"Feedback submission failed: {str(e)}")
-                else:
-                    logger.info("form submossion failed")
-        except Exception as e:
-            st.error(f"Error rendering feedback form: {str(e)}")
-            logger.error(f"Error rendering feedback form: {str(e)}")
 
 # Documents Page
 elif page == "Documents":
@@ -279,8 +320,6 @@ elif page == "Documents":
 elif page == "Document Management":
     st.title("Document Management")
     st.markdown("Upload or delete documents.")
-
-    # Upload section
     st.subheader("Upload Document")
     uploaded_file = st.file_uploader("Choose a file", type=["pdf", "txt"])
     if uploaded_file:
@@ -290,8 +329,6 @@ elif page == "Document Management":
                 if doc_id:
                     st.success(f"Uploaded {uploaded_file.name} with ID: {doc_id}")
                     st.session_state.uploaded_docs.append({"filename": uploaded_file.name, "id": doc_id})
-
-    # Document list with delete option
     st.subheader("Manage Documents")
     docs, _ = fetch_documents()
     if docs:
@@ -319,8 +356,6 @@ elif page == "Stats":
         st.metric("Average Response Time", f"{avg_time:.2f} seconds")
     else:
         st.metric("Average Response Time", "No queries yet")
-
-    # Fetch feedback stats
     try:
         feedback_response = requests.get(f"{st.session_state.api_url}/feedback_stats", timeout=10)
         feedback_response.raise_for_status()
@@ -330,7 +365,6 @@ elif page == "Stats":
     except Exception as e:
         st.error(f"Failed to fetch feedback stats: {str(e)}")
         logger.error(f"Failed to fetch feedback stats: {str(e)}")
-
     st.subheader("Most Often Hit Documents")
     if st.session_state.query_stats['doc_hits']:
         top_docs = st.session_state.query_stats['doc_hits'].most_common(5)
@@ -340,7 +374,6 @@ elif page == "Stats":
             st.write(f"- {doc}: {hits} hits")
     else:
         st.write("No document hits yet.")
-
     st.subheader("Query History")
     if st.session_state.chat_history:
         for i, msg in enumerate(st.session_state.chat_history):
@@ -349,6 +382,6 @@ elif page == "Stats":
                 if i + 1 < len(st.session_state.chat_history) and st.session_state.chat_history[i + 1]["role"] == "assistant":
                     response = st.session_state.chat_history[i + 1]
                     st.write(f"**Response**: {response['content'][:100]}...")
-                    st.write(f"Tokens: {response['tokens_used']}, Time: {response['response_time']:.2f}s")
+                    st.write(f"Tokens: {response.get('tokens_used', 0)}, Time: {response.get('response_time', 0):.2f}s")
     else:
         st.write("No queries yet.")
