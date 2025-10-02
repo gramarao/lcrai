@@ -22,7 +22,7 @@ start_service() {
             ;;
         uvicorn)
             echo "Starting Uvicorn (FastAPI)..."
-            nohup uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 120 >> "$UVICORN_LOG" 2>&1 &
+            nohup uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 120 --log-level info>> "$UVICORN_LOG" 2>&1 &
             echo "Uvicorn started (PID: $!). Check logs at $UVICORN_LOG"
             sleep 3  # Wait for Uvicorn to initialize
             ;;
@@ -54,7 +54,7 @@ stop_service() {
             ;;
         uvicorn)
             echo "Stopping Uvicorn..."
-            pkill -f "uvicorn.*app.api.main:app" && echo "Uvicorn stopped" || echo "No Uvicorn process found"
+            pkill -f "uvicorn.*app.api.main:app --workers 4 --log-level info" && echo "Uvicorn stopped" || echo "No Uvicorn process found"
             ;;
         streamlit)
             echo "Stopping Streamlit..."

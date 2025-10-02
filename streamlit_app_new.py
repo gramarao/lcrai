@@ -47,21 +47,27 @@ if 'current_query_id' not in st.session_state:
     st.session_state.current_query_id = None
 
 # Helper functions
+@st.cache_data(ttl=30)
 def fetch_documents():
-    logger.debug("Entering fetch_documents")
+    logger.info("Fetching documents from API")
     try:
-        response = requests.get(f"{st.session_state.api_url}/documents", timeout=10)
+        response = requests.get(
+            f"{st.session_state.api_url}/documents", 
+            timeout=30  # Increased from 10 to 30 seconds
+        )
         response.raise_for_status()
         docs = response.json()
         logger.info(f"Fetched {len(docs)} documents")
         corpus_size = sum(doc.get("content_length", 0) for doc in docs)
         return docs, corpus_size
+    except requests.exceptions.Timeout:
+        logger.error("Document fetch timed out after 30 seconds")
+        st.error("⚠️ Server is busy. Please wait and try again.")
+        return [], 0
     except Exception as e:
         logger.error(f"Failed to fetch documents: {str(e)}")
         st.error(f"Error fetching documents: {str(e)}")
         return [], 0
-    finally:
-        logger.debug("Exiting fetch_documents")
 
 def upload_document(file):
     logger.debug(f"Entering upload_document: {file.name}")
@@ -200,6 +206,7 @@ if page == "Chat":
                 payload = {
                     "question": question, 
                     "doc_ids": [str(doc_id) for doc_id in st.session_state.selected_doc_ids],
+                    "session_id": st.session_state.session_id,
                     "query_id": st.session_state.current_query_id
                 }
                 logger.info(f"Sending query to /api/query_stream with payload: {json.dumps(payload, indent=2)}")
@@ -217,6 +224,7 @@ if page == "Chat":
                                 
                                 if chunk["type"] == "content":
                                     st.session_state.current_response += chunk["chunk"]
+                                    st.session_state.current_quality_scores = chunk.get("quality_scores", None) 
                                     response_container.markdown(st.session_state.current_response)
                                     
                                 elif chunk["type"] == "complete":
@@ -234,13 +242,21 @@ if page == "Chat":
                                     st.session_state.chat_history.append({
                                         "role": "assistant",
                                         "content": st.session_state.current_response,
+                                        "question": st.session_state.current_question, 
                                         "sources": st.session_state.current_sources,
                                         "response_time": chunk.get("response_time", 0),
                                         "tokens_used": chunk.get("tokens_used", 0),
                                         "query_id": st.session_state.current_query_id,
-                                        "completed": True
+                                        "quality_scores": st.session_state.current_quality_scores, 
+                                        "completed": True,
+                                        "feedback_submitted": False
                                     })
-                                    
+                                    # Display quality scores
+                                    if st.session_state.current_quality_scores:
+                                        st.markdown("**Quality Scores:**")
+                                        for metric, score in st.session_state.current_quality_scores.items():
+                                            st.write(f"- {metric.replace('_', ' ').title()}: {score:.2f}")
+
                                     # Display final response
                                     response_container.markdown(st.session_state.current_response)
                                     
@@ -305,7 +321,8 @@ if page == "Chat":
                             "response_time": last_msg.get("response_time", 0.0),
                             "tokens_used": last_msg.get("tokens_used", 0),
                             "sources_count": len(valid_sources),
-                            "sources": valid_sources
+                            "sources": valid_sources,
+                            "quality_scores": last_msg.get("quality_scores", None) 
                         }
                         logger.info(f"Feedback payload: {json.dumps(feedback_payload, indent=2)}")
                         

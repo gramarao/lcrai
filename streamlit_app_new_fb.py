@@ -112,7 +112,7 @@ def validate_sources(sources):
         
         try:
             doc_id = str(source['document_id'])
-            chunk_id = str(source['id'])  # Expect 'id' from /api/query_stream
+            chunk_id = str(source['id'])  # Get the chunk ID from 'id' field
             
             # Optional UUID normalization
             try:
@@ -125,14 +125,15 @@ def validate_sources(sources):
             except ValueError:
                 logger.debug(f"chunk id is not a valid UUID, keeping as string: {chunk_id}")
             
+            # FIXED: Output 'id' to match Pydantic model expectation
             valid_sources.append({
                 "document_id": doc_id,
-                "chunk_id": chunk_id,  # Output 'chunk_id' for /api/feedback
+                "id": chunk_id,  # Use 'id' not 'chunk_id'
                 "relevance_score": source.get("relevance_score", 1.0),
                 "filename": source.get("filename", ""),
                 "chunk_index": source.get("chunk_index", 0)
             })
-            logger.debug(f"Validated source: document_id={doc_id}, chunk_id={chunk_id}")
+            logger.debug(f"Validated source: document_id={doc_id}, id={chunk_id}")
             
         except Exception as e:
             logger.error(f"Error processing source {source}: {str(e)}")
@@ -265,44 +266,96 @@ if page == "Chat":
                 thumbs_up = st.checkbox("Thumbs Up", key=f"thumbs_{form_key}")
                 feedback_text = st.text_area("Comments (optional)", key=f"comment_{form_key}")
                 submitted = st.form_submit_button("Submit Feedback")
+                # In your streamlit_app.py, in the feedback submission section:
                 if submitted:
-                    logger.info("Feedback form submitted")
+                    logger.info("=== STREAMLIT FEEDBACK DEBUG ===")
                     try:
+                        # Right before calling validate_sources, add:
+                        logger.info("=== RAW SOURCES DEBUG ===")
+                        raw_sources = last_msg.get("sources", [])
+                        for i, source in enumerate(raw_sources):
+                            logger.info(f"Raw source {i+1}: {json.dumps(source, indent=2, default=str)}")
+
                         valid_sources = validate_sources(last_msg.get("sources", []))
+                        # After validate_sources:
+                        logger.info("=== VALIDATED SOURCES DEBUG ===")
+                        for i, source in enumerate(valid_sources):
+                            logger.info(f"Validated source {i+1}: {json.dumps(source, indent=2, default=str)}")
+                        logger.info(f"Validated {len(valid_sources)} sources")
+                        
+                        # Log each source for debugging
+                        for i, source in enumerate(valid_sources):
+                            logger.info(f"Source {i+1}: {json.dumps(source, indent=2)}")
+                        
                         feedback_payload = {
                             "session_id": st.session_state.session_id,
                             "query_id": last_msg["query_id"],
-                            "question": st.session_state.current_question,
+                            "question": last_msg.get("question", st.session_state.current_question),
                             "response": last_msg.get("content", ""),
-                            "rating": rating,
-                            "thumbs_up": thumbs_up,
-                            "feedback_text": feedback_text,
-                            "response_time": last_msg.get("response_time", 0.0),
-                            "tokens_used": last_msg.get("tokens_used", 0),
+                            "rating": int(rating),  # Ensure it's an integer
+                            "thumbs_up": bool(thumbs_up),  # Ensure it's a boolean
+                            "feedback_text": feedback_text or "",  # Ensure it's not None
+                            "response_time": float(last_msg.get("response_time", 0.0)),
+                            "tokens_used": int(last_msg.get("tokens_used", 0)),
                             "sources_count": len(valid_sources),
                             "sources": valid_sources
                         }
-                        logger.info(f"Feedback payload: {json.dumps(feedback_payload, indent=2)}")
+                        
+                        # Add quality scores if available
+                        quality_scores = last_msg.get("quality_scores")
+                        if quality_scores and isinstance(quality_scores, dict):
+                            feedback_payload["quality_scores"] = {
+                                "relevance": float(quality_scores.get("relevance", 0.0)),
+                                "accuracy": float(quality_scores.get("accuracy", 0.0)),
+                                "completeness": float(quality_scores.get("completeness", 0.0)),
+                                "coherence": float(quality_scores.get("coherence", 0.0)),
+                                "citation": float(quality_scores.get("citation", 0.0)),
+                                "overall": float(quality_scores.get("overall", 0.0))
+                            }
+                            logger.info(f"Added quality scores: {feedback_payload['quality_scores']}")
+                        
+                        logger.info("=== FINAL PAYLOAD ===")
+                        logger.info(json.dumps(feedback_payload, indent=2, default=str))
+                        
+                        logger.info("Sending feedback to API...")
                         feedback_response = requests.post(
                             f"{st.session_state.api_url}/feedback", 
                             json=feedback_payload, 
-                            timeout=10
+                            timeout=30,
+                            headers={"Content-Type": "application/json"}
                         )
+                        
+                        logger.info(f"API Response Status: {feedback_response.status_code}")
+                        logger.info(f"API Response Headers: {dict(feedback_response.headers)}")
+                        
+                        if feedback_response.status_code != 200:
+                            logger.error(f"API Response Body: {feedback_response.text}")
+                        
                         feedback_response.raise_for_status()
                         st.success("Feedback submitted successfully!")
-                        logger.info("Feedback submitted successfully")
+                        logger.info("✅ Feedback submitted successfully")
                         last_msg["feedback_submitted"] = True
+                        
                     except requests.exceptions.HTTPError as e:
+                        logger.error("=== HTTP ERROR DETAILS ===")
                         err_resp = e.response
-                        try:
-                            error_detail = err_resp.json().get('detail', err_resp.text) if err_resp else str(e)
-                        except Exception:
-                            error_detail = err_resp.text if err_resp else str(e)
-                        st.error(f"Failed to submit feedback: {error_detail}")
-                        logger.error(f"Feedback submission failed: {error_detail}")
+                        if err_resp:
+                            logger.error(f"Status Code: {err_resp.status_code}")
+                            logger.error(f"Response Headers: {dict(err_resp.headers)}")
+                            try:
+                                error_detail = err_resp.json()
+                                logger.error(f"Error JSON: {json.dumps(error_detail, indent=2)}")
+                                st.error(f"Feedback submission failed: {error_detail}")
+                            except:
+                                error_text = err_resp.text
+                                logger.error(f"Error Text: {error_text}")
+                                st.error(f"Feedback submission failed: {error_text}")
+                        else:
+                            st.error(f"HTTP Error: {str(e)}")
+                        logger.error(f"Full HTTP error: {str(e)}")
                     except Exception as e:
+                        logger.exception("Unexpected error in feedback submission")
                         st.error(f"Failed to submit feedback: {str(e)}")
-                        logger.error(f"Feedback submission failed: {str(e)}")
 
 # Documents Page
 elif page == "Documents":
