@@ -28,9 +28,9 @@ start_service() {
             ;;
         streamlit)
             echo "Starting Streamlit..."
-            nohup streamlit run streamlit_app_new_fb.py --server.port=8501 >> "$STREAMLIT_LOG" 2>&1 &
+            nohup streamlit run lcr_fe.py --server.port=8501 >> "$STREAMLIT_LOG" 2>&1 &
             echo "Streamlit started (PID: $!). Check logs at $STREAMLIT_LOG"
-            sleep 3  # Wait for Streamlit to initialize
+            sleep 6  # Wait for Streamlit to initialize
             ;;
         all)
             echo "Starting all services..."

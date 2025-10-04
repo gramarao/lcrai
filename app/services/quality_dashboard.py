@@ -1,3 +1,7 @@
+import logging
+from typing import Dict, List, Optional, Any
+from datetime import datetime
+
 class QualityDashboard:
     def __init__(self):
         self.quality_attributes = {
@@ -33,7 +37,7 @@ class QualityDashboard:
             }
         }
     
-    def calculate_weighted_score(self, scores: Dict[str, float]) -> Dict[str, any]:
+    def calculate_weighted_score(self, scores: Dict[str, float]) -> Dict[str, Any]:
         """Calculate overall quality score with detailed breakdown"""
         weighted_sum = 0.0
         component_scores = {}
