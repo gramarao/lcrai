@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  cloud-sql-proxy:
+    image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:latest
+    container_name: lcr-cloud-sql-proxy
+    command:
+      - "--address=0.0.0.0"
+      - "--port=5432"
+      - "${GCP_INSTANCE_CONNECTION_NAME}"
+    ports:
+      - "5432:5432"
+    volumes:
+      - ${GOOGLE_APPLICATION_CREDENTIALS}:/config/service-account.json:ro
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/config/service-account.json
+    restart: unless-stopped
+    networks:
+      - lcr-network
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: lcr-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - cloud-sql-proxy
+    restart: unless-stopped
+    networks:
+      - lcr-network
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: lcr-frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - BACKEND_URL=http://backend:8000
+    env_file:
+      - .env
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - lcr-network
+
+networks:
+  lcr-network:
+    driver: bridge

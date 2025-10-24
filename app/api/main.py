@@ -19,7 +19,7 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.schema import Document as LC_Document
 import uuid
-
+from sqlalchemy import text, bindparam
 # Import your existing database components
 from app.models.database import SessionLocal, engine, Base
 import app.models.database as db_models
@@ -27,6 +27,27 @@ import app.models.database as db_models
 # At the top of main.py, after imports
 from collections import defaultdict
 import threading
+
+from langdetect import detect, DetectorFactory
+from langdetect.lang_detect_exception import LangDetectException
+from types import SimpleNamespace
+
+from fastapi.security import OAuth2PasswordRequestForm
+
+import logging
+logging.basicConfig()
+logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
+
+
+from app.api.auth import ( 
+    verify_password, get_password_hash, create_access_token, 
+    get_current_active_user, require_role, ACCESS_TOKEN_EXPIRE_MINUTES
+)
+
+
+# Set seed for consistent detection
+DetectorFactory.seed = 0
+
 
 # Global cache for previous scores (thread-safe)
 _score_cache = defaultdict(float)
@@ -43,14 +64,20 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS middleware
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:8501",
+        "http://127.0.0.1:8501", 
+        "https://lcr-frontend-24415162879.us-central1.run.app",
+        "*"  # Keep this for now during testing
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Configuration
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -73,6 +100,60 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def detect_language(text: str) -> str:
+    """
+    Detect language of input text
+    Returns ISO 639-1 language code (e.g., 'en', 'es', 'fr', 'hi', 'zh-cn')
+    """
+    try:
+        lang_code = detect(text)
+        
+        # Map common language codes to full names for better prompting
+        language_map = {
+            'en': 'English',
+            'es': 'Spanish',
+            'fr': 'French',
+            'de': 'German',
+            'it': 'Italian',
+            'pt': 'Portuguese',
+            'ru': 'Russian',
+            'ja': 'Japanese',
+            'ko': 'Korean',
+            'zh-cn': 'Simplified Chinese',
+            'zh-tw': 'Traditional Chinese',
+            'ar': 'Arabic',
+            'hi': 'Hindi',
+            'bn': 'Bengali',
+            'ta': 'Tamil',
+            'te': 'Telugu',
+            'mr': 'Marathi',
+            'ur': 'Urdu',
+            'vi': 'Vietnamese',
+            'th': 'Thai',
+            'nl': 'Dutch',
+            'pl': 'Polish',
+            'tr': 'Turkish',
+            'sv': 'Swedish',
+            'da': 'Danish',
+            'no': 'Norwegian',
+            'fi': 'Finnish',
+        }
+        
+        language_name = language_map.get(lang_code, 'English')
+        
+        print(f"🌍 Detected language: {language_name} ({lang_code})")
+        
+        return language_name
+        
+    except LangDetectException as e:
+        print(f"⚠️  Language detection failed: {e}, defaulting to English")
+        return 'English'
+    except Exception as e:
+        print(f"⚠️  Unexpected error in language detection: {e}")
+        return 'English'
+
 
 def chunk_text(text: str, source: str) -> List[str]:
     """Split text into chunks"""
@@ -108,48 +189,65 @@ def extract_text_from_file(file_content: bytes, filename: str) -> str:
         print(f"Error extracting text from {filename}: {e}")
         return ""
 
+
 async def vector_similarity_search(
     query: str, 
     db: Session, 
     limit: int = RETRIEVE_K
 ) -> List[Tuple[db_models.DocumentChunk, float]]:
-    """Perform pgvector similarity search - WITH LOGGING"""
+    """Optimized pgvector similarity search with caching and performance improvements"""
     try:
-        print(f"🔍 Embedding query: '{query[:50]}...'")
         # Generate query embedding
         query_embedding = embeddings.embed_query(query)
-        print(f"✅ Query embedding generated: {len(query_embedding)} dimensions")
         
-        print("🔍 Querying database...")
-        # Use pgvector cosine distance operator
-        results = db.query(
-            db_models.DocumentChunk,
-            (db_models.DocumentChunk.embedding.cosine_distance(query_embedding)).label("distance")
-        ).join(
-            db_models.Document
-        ).order_by(
-            text("distance")
-        ).limit(limit).all()
-        
-        print(f"✅ Database returned {len(results)} results")
-        
-        # Convert cosine distance to similarity (1 - distance)
+        # Optimized query with explicit index usage
+        # Using cosine distance for better semantic similarity
+        results = db.execute(
+            text("""
+                SELECT 
+                    dc.id,
+                    dc.document_id,
+                    dc.chunk_index,
+                    dc.content,
+                    dc.doc_metadata,
+                    d.filename,
+                    (dc.embedding <=> CAST(:query_embedding AS vector)) as distance
+                FROM document_chunks dc
+                JOIN documents d ON dc.document_id = d.id
+                ORDER BY dc.embedding <=> CAST(:query_embedding AS vector)
+                LIMIT :limit
+            """),
+            {
+                "query_embedding": str(query_embedding),
+                "limit": limit
+            }
+        ).fetchall()
+
+        # Convert results to chunks with similarity scores
         processed_results = []
-        for chunk, distance in results:
-            similarity = max(0.0, 1.0 - distance)
+        for row in results:
+
+            chunk = db_models.DocumentChunk()
+            chunk.id = row.id
+            chunk.document_id = row.document_id
+            chunk.chunk_index = row.chunk_index
+            chunk.content = row.content
+            chunk.doc_metadata = row.doc_metadata
+            chunk._filename = row.filename
+            
+            similarity = max(0.0, 1.0 - float(row.distance))
             processed_results.append((chunk, similarity))
-            print(f"  📄 {chunk.document.filename}: similarity={similarity:.3f}")
+            
         
+        db.commit()
         return processed_results
         
     except Exception as e:
-        import traceback
-        print(f"❌ Vector search error:")
-        print(f"Error type: {type(e).__name__}")
-        print(f"Error message: {str(e)}")
-        print(traceback.format_exc())
+        print(f"Vector search error: {e}")
         db.rollback()
         return []
+
+
 
 async def feedback_enhanced_search(
     query: str,
@@ -421,6 +519,8 @@ def set_current_model_in_db(db: Session, model: str) -> bool:
 class ChatRequest(BaseModel):
     query: str
     model: Optional[str] = None
+    session_id: Optional[str] = None  # Add session support
+    session_label: Optional[str] = None  # Add this
 
 class DeleteDocumentsRequest(BaseModel):
     documents: List[str]
@@ -458,6 +558,18 @@ class QualityScores(BaseModel):
     completeness: float
     coherence: float
     citation: float
+
+class ContactRequestSubmit(BaseModel):
+    query_id: str
+    name: str
+    email: str
+    phone: Optional[str] = None
+    company: Optional[str] = None
+    preferred_time: str
+    additional_notes: Optional[str] = None
+    original_query: str
+    original_response: str
+
 
 @app.post("/quality/analyze")
 async def analyze_quality(scores: QualityScores):
@@ -592,6 +704,107 @@ async def get_quality_attributes():
     }
 
 
+@app.post("/contact-requests")
+async def submit_contact_request(
+    request: ContactRequestSubmit,
+    current_user: db_models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Submit contact request for expert consultation"""
+    try:
+        # Convert query_id string to UUID, or generate new one if empty
+        try:
+            query_uuid = uuid.UUID(request.query_id) if request.query_id else uuid.uuid4()
+        except (ValueError, AttributeError):
+            query_uuid = uuid.uuid4()
+        
+        # Create contact request record
+        contact_request = db_models.ContactRequest(
+            query_id=query_uuid,  # Use the UUID
+            name=request.name,
+            email=request.email,
+            phone=request.phone,
+            company=request.company,
+            preferred_time=request.preferred_time,
+            additional_notes=request.additional_notes,
+            original_query=request.original_query,
+            original_response=request.original_response[:1000] if request.original_response else "",
+            status="pending"
+        )
+        
+        db.add(contact_request)
+        db.commit()
+        db.refresh(contact_request)
+        
+        # Log for monitoring
+        print(f"\n{'='*60}")
+        print(f"📞 NEW CONTACT REQUEST")
+        print(f"{'='*60}")
+        print(f"ID: {contact_request.id}")
+        print(f"Query ID: {query_uuid}")
+        print(f"Name: {request.name}")
+        print(f"Email: {request.email}")
+        print(f"Phone: {request.phone or 'Not provided'}")
+        print(f"Company: {request.company or 'Not provided'}")
+        print(f"Preferred Time: {request.preferred_time}")
+        print(f"Question: {request.original_query}")
+        if request.additional_notes:
+            print(f"Notes: {request.additional_notes}")
+        print(f"{'='*60}\n")
+        
+        return {
+            "status": "success",
+            "message": "Contact request received. An expert will reach out within 24 hours.",
+            "request_id": str(contact_request.id)
+        }
+        
+    except Exception as e:
+        db.rollback()
+        print(f"❌ Error saving contact request: {e}")
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to save contact request: {str(e)}")
+
+@app.get("/contact-requests")
+async def get_contact_requests(
+    status: Optional[str] = None,
+    current_user: db_models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Get contact requests (admin only)"""
+    
+    # Only allow admin/superuser
+    if current_user.role not in ["admin", "superuser"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        query = db.query(db_models.ContactRequest)
+        
+        if status:
+            query = query.filter(db_models.ContactRequest.status == status)
+        
+        requests = query.order_by(desc(db_models.ContactRequest.created_at)).limit(100).all()
+        
+        return {
+            "total": len(requests),
+            "requests": [
+                {
+                    "id": str(req.id),
+                    "name": req.name,
+                    "email": req.email,
+                    "phone": req.phone,
+                    "company": req.company,
+                    "preferred_time": req.preferred_time,
+                    "original_query": req.original_query,
+                    "status": req.status,
+                    "created_at": req.created_at.isoformat()
+                }
+                for req in requests
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Initialize system on startup
 @app.on_event("startup")
 async def startup_event():
@@ -646,144 +859,287 @@ async def health_check(db: Session = Depends(get_db)):
             "timestamp": datetime.utcnow().isoformat()
         }
 
+
 @app.post("/chat")
-async def chat_endpoint(request: ChatRequest, db: Session = Depends(get_db)):
-    """Main RAG chat endpoint - WITH FEEDBACK ENHANCEMENT"""
+async def chat_endpoint(
+    request: ChatRequest, 
+    current_user: db_models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)):
+    """Enhanced RAG chat with session persistence and conversation history"""
     start_time = time.time()
-    query_id = str(uuid.uuid4())
+    timing_breakdown = {}
     
     try:
-        print(f"📥 Received query: {request.query}")
         model_to_use = request.model or get_current_model_from_db(db)
-        print(f"🤖 Using model: {model_to_use}")
         
-        # Get feedback configuration
-        feedback_config = await get_feedback_config(db)
-        feedback_enabled = feedback_config.get("feedback_enabled", True)
-        feedback_weight = feedback_config.get("feedback_weight", 0.3)
+        # Get or create session
+        t_session = time.time()
+        session = None
+        if hasattr(request, 'session_id') and request.session_id:
+            session = db.query(db_models.ChatSession).filter(
+                db_models.ChatSession.session_id == request.session_id
+            ).first()
         
-        print(f"🎯 Feedback-enhanced retrieval: {feedback_enabled} (weight: {feedback_weight})")
+        if not session:
+            session = db_models.ChatSession(user_id=current_user.id)
+            db.add(session)
+            db.flush()
         
-        # Use feedback-enhanced search if enabled
-        if feedback_enabled:
-            retrieved_chunks = await feedback_enhanced_search(
-                request.query, 
-                db, 
-                RETRIEVE_K,
-                feedback_weight
-            )
-        else:
-            retrieved_chunks = await vector_similarity_search(request.query, db, RETRIEVE_K)
+        if request.session_label and request.session_label != session.session_label:
+            session.session_label = request.session_label
         
-        print(f"✅ Found {len(retrieved_chunks)} chunks")
+        session.last_activity = datetime.utcnow()
+        timing_breakdown['session_setup'] = (time.time() - t_session) * 1000
         
-        # Rest of the endpoint stays the same...
-        if not retrieved_chunks:
-            return {
-                "answer": "I don't have enough context to answer your question. Please upload relevant documents.",
-                "latency_ms": (time.time() - start_time) * 1000,
-                "quality": {"score": 0, "notes": "No relevant documents found"},
-                "sources": [],
-                "model_used": model_to_use
-            }
+        # Get conversation history
+        t_history = time.time()
+        previous_messages = db.query(db_models.ChatMessage).filter(
+            db_models.ChatMessage.session_id == session.id
+        ).order_by(
+            desc(db_models.ChatMessage.timestamp)
+        ).limit(10).all()
+        previous_messages.reverse()
+        timing_breakdown['history_fetch'] = (time.time() - t_history) * 1000
         
-        # Build context
-        print("📝 Building context...")
-        context_parts = []
-        for chunk, similarity in retrieved_chunks:
-            source = chunk.document.filename if chunk.document else "unknown"
-            context_parts.append(f"[{source}] {chunk.content}")
-        
-        context = "\n\n".join(context_parts)
-        
-        # TRIM CONTEXT if too long
-        MAX_CONTEXT_LENGTH = 15000  # ~15K characters
-        if len(context) > MAX_CONTEXT_LENGTH:
-            print(f"⚠️  Context too long ({len(context)} chars), trimming to {MAX_CONTEXT_LENGTH}")
-            context = context[:MAX_CONTEXT_LENGTH] + "\n\n[Context truncated for brevity]"
-
-        print(f"✅ Context built: {len(context)} characters")
-        
-        # Generate response
-        print("🧠 Generating response with LLM...")
-        llm = ChatGoogleGenerativeAI(
-            model=model_to_use, 
-            temperature=0.0,
-            convert_system_message_to_human=True
+        # Create current message record
+        chat_message = db_models.ChatMessage(
+            session_id=session.id,
+            query=request.query,
+            model_used=model_to_use,
+            timestamp=datetime.utcnow()
         )
+        db.add(chat_message)
+        db.flush()
         
-        combined_prompt = f"""You are a helpful assistant specializing in EB-5 immigration and investment documentation.
+        # Vector similarity search
+        t_vector = time.time()
+        retrieved_chunks = await vector_similarity_search(request.query, db, RETRIEVE_K)
+        timing_breakdown['vector_search'] = (time.time() - t_vector) * 1000
+        
+        # 🔍 ENCODING CHECK 1 - From Database
+        print(f"\n{'='*60}")
+        print(f"🔍 ENCODING CHECK 1 - Retrieved from Database")
+        print(f"Query: {request.query}")
+        print(f"Retrieved {len(retrieved_chunks) if retrieved_chunks else 0} chunks")
+        
+        if not retrieved_chunks:
+            answer = "I don't have enough context to answer your question. Please upload relevant documents."
+            quality = {"score": 0, "notes": "No relevant documents found"}
+            sources = []
+            sources_count = 0
+            print(f"⚠️ No chunks retrieved")
+        else:
+            # Log database chunks
+            for i, (chunk, similarity) in enumerate(retrieved_chunks[:2]):
+                chunk_preview = chunk.content[:300].replace('\n', ' ')
+                print(f"  Chunk {i+1} (similarity: {similarity:.3f}):")
+                print(f"    Preview: {chunk_preview}...")
+                
+                # Check for I-5 pattern
+                if 'I-5' in chunk.content:
+                    i5_start = chunk.content.find('I-5')
+                    i5_section = chunk.content[i5_start:i5_start+30]
+                    print(f"    ⚠️ Found I-5 pattern: '{i5_section}'")
+                    print(f"    🔬 Hex: {i5_section.encode('unicode-escape').decode('ascii')}")
+            
+            # Build context from retrieved documents
+            t_context = time.time()
+            context_parts = []
+            for chunk, similarity in retrieved_chunks:
+                source = chunk._filename
+                context_parts.append(f"[Source: {source}]\n{chunk.content}")
+            context = "\n\n---\n\n".join(context_parts)
+            timing_breakdown['context_build'] = (time.time() - t_context) * 1000
+            
+            # 📤 ENCODING CHECK 2 - Sending to Gemini
+            print(f"\n📤 ENCODING CHECK 2 - Context Prepared for Gemini")
+            context_preview = context[:400].replace('\n', ' ')
+            print(f"  Context preview: {context_preview}...")
+            
+            if 'I-5' in context:
+                i5_start = context.find('I-5')
+                i5_section = context[i5_start:i5_start+30]
+                print(f"  ⚠️ I-5 in context: '{i5_section}'")
+                print(f"  🔬 Hex: {i5_section.encode('unicode-escape').decode('ascii')}")
+            
+            # Build conversation history for context
+            conversation_history = []
+            for prev_msg in previous_messages[-4:]:
+                if prev_msg.query:
+                    conversation_history.append({
+                        "role": "user",
+                        "content": prev_msg.query
+                    })
+                if prev_msg.response:
+                    conversation_history.append({
+                        "role": "assistant",
+                        "content": prev_msg.response
+                    })
+            
+            # Generate response with enforced system prompt
+            t_llm = time.time()
+            llm = ChatGoogleGenerativeAI(
+                model=model_to_use, 
+                temperature=0.1,
+                top_p=0.95,
+                convert_system_message_to_human=True
+            )
+            
+            system_prompt = """You are a professional RAG assistant. Follow these rules strictly:
 
-Answer the question using ONLY the context provided below. Be comprehensive but concise.
+1. ONLY answer based on the provided CONTEXT below
+2. ALWAYS respond in the SAME LANGUAGE as the user's question
+3. If the user asks in English, respond in English
+4. If the user asks in French, respond in French
+5. If the answer is not in the context, say "I don't have that information in the available documents"
+6. Be concise and accurate
+7. Cite sources when relevant
 
-If the answer is not in the context, say "I don't have enough information to answer that."
+DO NOT translate the user's question or change languages unless explicitly asked."""
 
-IMPORTANT: Focus on the most relevant information from the sources provided.
-
-Context:
+            messages = [
+                {"role": "system", "content": system_prompt}
+            ]
+            
+            if conversation_history:
+                messages.extend(conversation_history)
+            
+            user_message = f"""CONTEXT from documents:
 {context}
 
-Question: {request.query}
+---
 
-Provide a clear, well-structured answer:"""
+USER QUESTION: {request.query}
+
+Remember: Answer in the same language as the question above."""
+
+            messages.append({"role": "user", "content": user_message})
+            
+            response = await llm.ainvoke(messages)
+            answer = response.content
+            timing_breakdown['llm_generation'] = (time.time() - t_llm) * 1000
+            
+            # 📥 ENCODING CHECK 3 - Received from Gemini
+            print(f"\n📥 ENCODING CHECK 3 - Response from Gemini")
+            answer_preview = answer[:400].replace('\n', ' ')
+            print(f"  Answer preview: {answer_preview}...")
+            
+            if 'I-5' in answer:
+                i5_start = answer.find('I-5')
+                i5_section = answer[i5_start:i5_start+30]
+                print(f"  ⚠️ I-5 in answer: '{i5_section}'")
+                print(f"  🔬 Hex: {i5_section.encode('unicode-escape').decode('ascii')}")
+                
+                # Check if corruption happened
+                if 'Ƒѵ' in i5_section or 'ƒ' in i5_section:
+                    print(f"  ❌ CORRUPTION DETECTED in LLM response!")
+            
+            print(f"{'='*60}\n")
+            
+            # Compute quality metrics
+            t_quality = time.time()
+            quality = await compute_quality_metrics(request.query, answer, retrieved_chunks, db)
+            quality["sources_used"] = len(retrieved_chunks)
+            timing_breakdown['quality_metrics'] = (time.time() - t_quality) * 1000
+            
+            # Save sources
+            t_sources = time.time()
+            for i, (chunk, similarity) in enumerate(retrieved_chunks):
+                source_record = db_models.MessageSource(
+                    message_id=chat_message.id,
+                    chunk_id=chunk.id,
+                    source_name=chunk._filename,
+                    similarity_score=similarity,
+                    rank_position=i + 1
+                )
+                db.add(source_record)
+            timing_breakdown['save_sources'] = (time.time() - t_sources) * 1000
+            
+            sources = [
+                {
+                    "source": chunk._filename,
+                    "similarity": round(similarity, 3),
+                    "chunk_preview": chunk.content[:150] + "..." if len(chunk.content) > 150 else chunk.content
+                }
+                for chunk, similarity in retrieved_chunks
+            ]
         
-        response = await llm.ainvoke([
-            {"role": "user", "content": combined_prompt}
-        ])
-        
-        answer = response.content
         latency_ms = (time.time() - start_time) * 1000
-        print(f"✅ Response generated in {latency_ms:.2f}ms")
         
-        # Compute quality metrics
-        print("📊 Computing quality metrics...")
-        quality = await compute_quality_metrics(request.query, answer, retrieved_chunks, db)
+        # Update message with response
+        chat_message.response = answer
+        chat_message.response_time_ms = latency_ms
+        chat_message.quality_score = quality.get("score", 0)
         
-        # Add feedback enhancement info to quality
-        quality["feedback_enhanced"] = feedback_enabled
-        quality["feedback_weight"] = feedback_weight if feedback_enabled else 0.0
+        t_commit = time.time()
+        db.commit()
+        timing_breakdown['db_commit'] = (time.time() - t_commit) * 1000
         
-        # Prepare sources
-        sources = [
-            {
-                "source": chunk.document.filename if chunk.document else "unknown",
-                "similarity": round(similarity, 3),
-                "chunk_id": str(chunk.id),
-                "document_id": str(chunk.document_id)
-            }
-            for chunk, similarity in retrieved_chunks
-        ]
+        # Log timing breakdown
+        print(f"⏱️ TIMING BREAKDOWN (Total: {latency_ms:.0f}ms):")
+        for key, value in timing_breakdown.items():
+            print(f"  {key}: {value:.0f}ms ({value/latency_ms*100:.1f}%)")
         
-        print("✅ Chat processing complete!")
+        # 🚀 FINAL ENCODING CHECK - Before sending to frontend
+        print(f"\n🚀 FINAL CHECK - Response being sent to frontend:")
+        print(f"  Answer length: {len(answer)} chars")
+        if 'I-5' in answer:
+            i5_start = answer.find('I-5')
+            i5_section = answer[i5_start:i5_start+30]
+            print(f"  I-5 section: '{i5_section}'")
         
         return {
             "answer": answer,
             "latency_ms": round(latency_ms, 2),
+            "timing_breakdown": timing_breakdown,
             "quality": quality,
             "sources": sources,
+            "sources_count": len(sources),
             "model_used": model_to_use,
-            "query_id": query_id
+            "session_id": session.session_id,
+            "conversation_length": len(previous_messages) + 1,
+            "query_id": str(chat_message.id)
         }
         
     except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        print(f"❌ ERROR in chat endpoint:")
-        print(error_details)
-        
         db.rollback()
-        
+        print(f"❌ Chat error: {e}")
+        import traceback
+        print(traceback.format_exc())
         return JSONResponse(
             status_code=500,
             content={
                 "error": f"Chat processing failed: {str(e)}",
-                "error_type": type(e).__name__,
                 "answer": "I apologize, but I encountered an error processing your request.",
                 "latency_ms": (time.time() - start_time) * 1000,
                 "quality": {"score": 0},
-                "sources": []
+                "sources": [],
+                "sources_count": 0 
             }
         )
+
+# Admin-only endpoints
+@app.get("/admin/users")
+async def list_users(
+    current_user: db_models.User = Depends(require_role(["admin", "superuser"])),
+    db: Session = Depends(get_db)
+):
+    users = db.query(db_models.User).all()
+    return [{"username": u.username, "email": u.email, "role": u.role} for u in users]
+
+@app.get("/admin/cache-stats")
+async def get_cache_stats():
+    """Get LRU cache statistics"""
+    if hasattr(get_cached_embedding, 'cache_info'):
+        info = get_cached_embedding.cache_info()
+        return {
+            "hits": info.hits,
+            "misses": info.misses,
+            "size": info.currsize,
+            "maxsize": info.maxsize,
+            "hit_rate": round(info.hits / (info.hits + info.misses), 2) if (info.hits + info.misses) > 0 else 0
+        }
+    return {"error": "Cache not configured"}
 
 @app.post("/upload")
 async def upload_documents(files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
@@ -830,22 +1186,22 @@ async def upload_documents(files: List[UploadFile] = File(...), db: Session = De
             db.flush()
             
             # Process chunks
-            chunks = chunk_text(text, filename)
+            text_chunks = chunk_text(text, filename)
             
             # Batch embed chunks for efficiency
-            chunk_embeddings = embeddings.embed_documents(chunks)
+            chunk_embeddings = embeddings.embed_documents(text_chunks)
             
-            for i, (chunk_text, embedding) in enumerate(zip(chunks, chunk_embeddings)):
-                chunk_hash = hashlib.md5(chunk_text.encode()).hexdigest()
+            for i, (chunk_content, embedding) in enumerate(zip(text_chunks, chunk_embeddings)):
+                chunk_hash = hashlib.md5(chunk_content.encode()).hexdigest()
                 
                 chunk_record = db_models.DocumentChunk(
                     id=uuid.uuid4(),
                     document_id=doc_record.id,
                     chunk_index=i,
-                    content=chunk_text,
+                    content=chunk_content,
                     embedding=embedding,
                     content_hash=chunk_hash,
-                    doc_metadata={"source": filename, "chunk_size": len(chunk_text)},
+                    doc_metadata={"source": filename, "chunk_size": len(chunk_content)},
                     created_at=datetime.utcnow()
                 )
                 db.add(chunk_record)
@@ -879,7 +1235,7 @@ async def list_documents(db: Session = Depends(get_db)):
 
 @app.delete("/documents")
 async def delete_documents(request: DeleteDocumentsRequest, db: Session = Depends(get_db)):
-    """Delete documents and associated chunks"""
+    """Delete documents and associated chunks with manual cascade"""
     try:
         deleted_count = 0
         deleted_filenames = []
@@ -890,14 +1246,29 @@ async def delete_documents(request: DeleteDocumentsRequest, db: Session = Depend
             ).first()
             
             if doc:
-                db.delete(doc)  # Cascade will handle chunks
+                # Get all chunk IDs before deletion
+                chunk_ids = [chunk.id for chunk in doc.chunks]
+                
+                if chunk_ids:
+                    # Delete records that reference chunks
+                    db.query(db_models.FeedbackSource).filter(
+                        db_models.FeedbackSource.chunk_id.in_(chunk_ids)
+                    ).delete(synchronize_session=False)
+                    
+                    db.query(db_models.MessageSource).filter(
+                        db_models.MessageSource.chunk_id.in_(chunk_ids)
+                    ).delete(synchronize_session=False)
+                
+                # Delete document (cascade will handle chunks)
+                db.delete(doc)
+                
                 deleted_count += 1
                 deleted_filenames.append(filename)
         
         db.commit()
         
         return {
-            "message": f"Deleted {deleted_count} documents",
+            "message": f"Deleted {deleted_count} documents and all related data",
             "deleted_count": deleted_count,
             "deleted_sources": deleted_filenames
         }
@@ -923,8 +1294,7 @@ async def get_selected_model(db: Session = Depends(get_db)):
         "available_models": [
             "gemini-2.5-flash",           # Current - Fast & efficient
             "gemini-2.5-pro",             # Most capable
-            "gemini-1.5-flash-latest",    # Cheaper alternative
-            "gemini-1.5-pro-latest"       # Previous gen pro
+            "gemini-2.5-flash-lite"
         ],
         "last_updated": last_updated
     }
@@ -978,6 +1348,7 @@ async def generate_questions(request: QuestionGenerationRequest, db: Session = D
         full_content = " ".join([chunk.content for chunk in chunks])[:6000]
         
         current_model = get_current_model_from_db(db)
+        
         llm = ChatGoogleGenerativeAI(model=current_model, temperature=0.3)
         
         prompt = f"""
@@ -1044,8 +1415,12 @@ async def submit_feedback(feedback: FeedbackSubmission, db: Session = Depends(ge
             # If it's not a valid UUID, use it as string
             query_uuid = feedback.query_id
         
+        print(f"query uuid: {query_uuid}")
         # Check if feedback already exists for this query
         # Use string comparison since query_id is stored as VARCHAR in your schema
+        print(f"query_uuid value: {query_uuid}")
+        print(f"query_uuid type: {type(query_uuid)}")
+        print(f"UserFeedback.query_id column type: {db_models.UserFeedback.query_id.type}")
         existing_feedback = db.query(db_models.UserFeedback).filter(
             db_models.UserFeedback.query_id == query_uuid
         ).first()
@@ -1486,6 +1861,283 @@ async def get_analytics(db: Session = Depends(get_db)):
                 "error": str(e)
             }
         )
+
+
+@app.get("/sessions/summaries")
+async def get_session_summaries(
+    current_user: db_models.User = Depends(require_role(["admin", "superuser"])),
+    db: Session = Depends(get_db)):
+    """Get summaries of last 10 sessions"""
+    sessions = db.query(db_models.ChatSession).order_by(
+        desc(db_models.ChatSession.last_activity)
+    ).limit(10).all()
+    
+    summaries = []
+    for session in sessions:
+        messages = db.query(db_models.ChatMessage).filter(
+            db_models.ChatMessage.session_id == session.id
+        ).order_by(db_models.ChatMessage.timestamp).all()
+        
+        # Generate summary from first and last messages
+        if messages:
+            first_q = messages[0].query[:100]
+            summary = f"Started with: '{first_q}...'"
+            if len(messages) > 1:
+                last_q = messages[-1].query[:100]
+                summary += f"\nEnded with: '{last_q}...'"
+        else:
+            summary = "No messages"
+        
+        display_name = session.session_label if session.session_label else session.created_at.strftime('%Y-%m-%d %H:%M')
+        
+        summaries.append({
+            "session_id": session.session_id,
+            "display_name": display_name,
+            "created_at": session.created_at.isoformat(),
+            "last_activity": session.last_activity.isoformat(),
+            "message_count": len(messages),
+            "summary": summary
+        })
+    
+    return summaries
+
+@app.get("/sessions/{session_id}")
+async def get_session_history(session_id: str, db: Session = Depends(get_db)):
+    """Get conversation history for a session"""
+    try:
+        session = db.query(db_models.ChatSession).filter(
+            db_models.ChatSession.session_id == session_id
+        ).first()
+        
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        messages = db.query(db_models.ChatMessage).filter(
+            db_models.ChatMessage.session_id == session.id
+        ).order_by(db_models.ChatMessage.timestamp).all()
+        
+        return {
+            "session_id": session.session_id,
+            "created_at": session.created_at.isoformat(),
+            "last_activity": session.last_activity.isoformat(),
+            "message_count": len(messages),
+            "messages": [
+                {
+                    "id": msg.id,
+                    "query": msg.query,
+                    "response": msg.response,
+                    "model_used": msg.model_used,
+                    "quality_score": msg.quality_score,
+                    "timestamp": msg.timestamp.isoformat()
+                }
+                for msg in messages
+            ]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get session: {str(e)}")
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str, db: Session = Depends(get_db)):
+    """Delete a session and its messages"""
+    try:
+        session = db.query(db_models.ChatSession).filter(
+            db_models.ChatSession.session_id == session_id
+        ).first()
+        
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        db.delete(session)  # Cascade will delete messages
+        db.commit()
+        
+        return {
+            "success": True,
+            "message": f"Session {session_id} deleted"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete session: {str(e)}")
+
+
+@app.get("/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str, db: Session = Depends(get_db)):
+    """Get all messages for a session"""
+    session = db.query(db_models.ChatSession).filter(
+        db_models.ChatSession.session_id == session_id
+    ).first()
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    messages = db.query(db_models.ChatMessage).filter(
+        db_models.ChatMessage.session_id == session.id
+    ).order_by(db_models.ChatMessage.timestamp).all()
+    
+    return [
+        {
+            "query": m.query,
+            "response": m.response,
+            "timestamp": m.timestamp.isoformat(),
+            "quality_score": m.quality_score
+        }
+        for m in messages
+    ]
+
+@app.get("/admin/system-stats")
+async def get_system_stats(
+    current_user: db_models.User = Depends(require_role(["admin", "superuser"])),
+    db: Session = Depends(get_db)):
+    """Get real-time system statistics"""
+    from datetime import timedelta
+    
+    # Total sessions
+    total_sessions = db.query(db_models.ChatSession).count()
+    
+    # Active sessions (last 24 hours)
+    cutoff = datetime.utcnow() - timedelta(hours=24)
+    active_sessions = db.query(db_models.ChatSession).filter(
+        db_models.ChatSession.last_activity > cutoff
+    ).count()
+    
+    # Average response time
+    avg_time = db.query(func.avg(db_models.ChatMessage.response_time_ms)).scalar()
+    avg_time_seconds = (avg_time / 1000) if avg_time else 0
+    
+    # Most accessed document
+    top_doc = db.query(
+        db_models.MessageSource.source_name,
+        func.count(db_models.MessageSource.id).label('count')
+    ).group_by(
+        db_models.MessageSource.source_name
+    ).order_by(desc('count')).first()
+    
+    return {
+        "total_sessions": total_sessions,
+        "active_sessions": active_sessions,
+        "avg_response_time": round(avg_time_seconds, 1),
+        "top_document": top_doc.source_name if top_doc else "None",
+        "top_document_count": top_doc.count if top_doc else 0
+    }
+
+@app.patch("/sessions/{session_id}/label")
+async def update_session_label(session_id: str, request: dict, db: Session = Depends(get_db)):
+    """Update session label"""
+    session = db.query(db_models.ChatSession).filter(
+        db_models.ChatSession.session_id == session_id
+    ).first()
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    session.session_label = request.get("label", "")
+    db.commit()
+    
+    return {"success": True, "label": session.session_label}
+
+
+@app.get("/sessions")
+async def list_sessions(db: Session = Depends(get_db)):
+    """List all chat sessions with labels"""
+    sessions = db.query(
+        db_models.ChatSession.session_id,
+        db_models.ChatSession.session_label,
+        db_models.ChatSession.created_at,
+        db_models.ChatSession.last_activity,
+        func.count(db_models.ChatMessage.id).label('message_count')
+    ).outerjoin(
+        db_models.ChatMessage
+    ).group_by(
+        db_models.ChatSession.id
+    ).order_by(
+        desc(db_models.ChatSession.last_activity)
+    ).limit(20).all()
+    
+    return [
+        {
+            "session_id": s.session_id,
+            "session_label": s.session_label,
+            "created_at": s.created_at.isoformat(),
+            "last_activity": s.last_activity.isoformat(),
+            "message_count": s.message_count
+        }
+        for s in sessions
+    ]
+
+@app.post("/token")
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(db_models.User).filter(db_models.User.username == form_data.username).first()
+    
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token = create_access_token(
+        data={"sub": user.username, "role": user.role},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    return {"access_token": access_token, "token_type": "bearer", "role": user.role}
+
+@app.post("/register")
+async def register(username: str, email: str, password: str, full_name: str = "", db: Session = Depends(get_db)):
+    """Register new user"""
+    if db.query(db_models.User).filter(db_models.User.username == username).first():
+        raise HTTPException(status_code=400, detail="Username already exists")
+    
+    user = db_models.User(
+        username=username,
+        email=email,
+        hashed_password=get_password_hash(password),
+        full_name=full_name,
+        role="user"
+    )
+    db.add(user)
+    db.commit()
+    return {"message": "User created successfully"}
+
+from functools import lru_cache
+import hashlib
+
+# Add at module level
+@lru_cache(maxsize=1000)
+def get_cached_embedding(text_hash: str):
+    """Cache embeddings to avoid redundant API calls"""
+    # This is a placeholder - actual embedding happens in the calling function
+    return None
+
+def get_text_hash(text: str) -> str:
+    """Generate hash for text caching"""
+    return hashlib.md5(text.encode()).hexdigest()
+
+async def vector_similarity_search_cached(
+    query: str, 
+    db: Session, 
+    limit: int = RETRIEVE_K
+) -> List[Tuple[db_models.DocumentChunk, float]]:
+    """Vector search with query caching"""
+    
+    query_hash = get_text_hash(query)
+    
+    # Check if we've seen this exact query recently
+    cached_embedding = get_cached_embedding(query_hash)
+    
+    if cached_embedding is None:
+        # Generate new embedding
+        query_embedding = embeddings.embed_query(query)
+        # Cache it (in production, use Redis or similar)
+        get_cached_embedding.__wrapped__(query_hash, query_embedding)
+    else:
+        query_embedding = cached_embedding
+    
+    # Rest of the search logic...
+    # (Use the optimized query from Solution 3)
+
 
 if __name__ == "__main__":
     import uvicorn

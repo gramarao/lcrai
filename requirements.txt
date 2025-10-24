@@ -1,11 +1,15 @@
 # Core FastAPI and database
-fastapi==0.104.1
+fastapi==0.115.0
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 sqlalchemy==2.0.23
 psycopg[binary]==3.1.13
 python-dotenv==1.0.0
 
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+plotly==5.18.0
 # pgvector integration (Critical!)
 pgvector==0.2.4
 
@@ -21,3 +25,14 @@ numpy
 pydantic
 PyPDF2
 
+langdetect==1.0.9
+
+streamlit>=1.28.0
+anthropic>=0.7.0
+python-dotenv>=1.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6

@@ -5,6 +5,11 @@ from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
 from pydantic import BaseModel
 
+from dotenv import load_dotenv
+load_dotenv()
+
+from passlib.context import CryptContext
+
 import uuid
 import os
 
@@ -13,7 +18,7 @@ from pgvector.sqlalchemy import Vector
 # Database URL with connection pooling
 SQLALCHEMY_DATABASE_URL = os.getenv(
     "DATABASE_URL", 
-    "postgresql://user:password@localhost:5432/rag_db"
+    "postgresql://user:password@localhost:5432/ragdb"
 )
 
 # Critical: Gemini text-embedding-004 produces 768-dimensional vectors
@@ -106,6 +111,27 @@ class FeedbackSource(Base):
     
     feedback = relationship("UserFeedback", back_populates="sources")
 
+class ContactRequest(Base):
+    __tablename__ = "contact_requests"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    query_id = Column(UUID(as_uuid=True), nullable=False)
+    name = Column(String, nullable=False)
+    email = Column(String, nullable=False)
+    phone = Column(String, nullable=True)
+    company = Column(String, nullable=True)
+    preferred_time = Column(String, nullable=False)
+    additional_notes = Column(Text, nullable=True)
+    original_query = Column(Text, nullable=False)
+    original_response = Column(Text, nullable=True)
+    status = Column(String, default="pending")  # pending, contacted, completed
+    created_at = Column(DateTime, default=datetime.utcnow)
+    contacted_at = Column(DateTime, nullable=True)
+    
+    def __repr__(self):
+        return f"<ContactRequest(name={self.name}, email={self.email}, status={self.status})>"
+
+
 class QueryPerformance(Base):
     __tablename__ = "query_performance"
     
@@ -141,6 +167,68 @@ class QualityScores(BaseModel):
     coherence: float
     citation: float
 
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username = Column(String, unique=True, index=True, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    full_name = Column(String)
+    role = Column(String, default="user")  # user, admin, superuser
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Link sessions to users
+    sessions = relationship("ChatSession", back_populates="user")
+
+# Update ChatSession
+class ChatSession(Base):
+    __tablename__ = "rag_chat_sessions"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(String, unique=True, index=True, default=lambda: str(uuid.uuid4()))
+    session_label = Column(String)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))  # Add this
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_activity = Column(DateTime, default=datetime.utcnow)
+    
+    messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
+    user = relationship("User", back_populates="sessions")  # Add this
+
+
+class ChatMessage(Base):
+    __tablename__ = "rag_chat_messages"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(UUID(as_uuid=True), ForeignKey("rag_chat_sessions.id"), nullable=False)
+    query = Column(Text, nullable=False)
+    response = Column(Text)
+    model_used = Column(String)
+    response_time_ms = Column(Float)
+    quality_score = Column(Float)
+    user_rating = Column(Integer)
+    user_feedback = Column(Text)
+    feedback_timestamp = Column(DateTime)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    
+    session = relationship("ChatSession", back_populates="messages")
+    sources = relationship("MessageSource", back_populates="message", cascade="all, delete-orphan")
+
+class MessageSource(Base):
+    __tablename__ = "rag_message_sources"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    message_id = Column(UUID(as_uuid=True), ForeignKey("rag_chat_messages.id"), nullable=False)
+    chunk_id = Column(UUID(as_uuid=True), ForeignKey("document_chunks.id"), nullable=False)
+    source_name = Column(String, nullable=False)
+    similarity_score = Column(Float)
+    rank_position = Column(Integer)
+    
+    message = relationship("ChatMessage", back_populates="sources")
 
 class ModelFeedback(Base):
     """Model comparison feedback for tuning"""

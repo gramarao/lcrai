@@ -6,14 +6,57 @@ import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
-# Configuration
-BACKEND_URL = "http://localhost:8000"
+from login import check_authentication, login_page
 
 st.set_page_config(
-    page_title="RAG Admin Panel",
-    page_icon="⚙️",
+    page_title="LCR Capital Partners - Admin",
+    page_icon="🏢",
     layout="wide"
 )
+
+# Configuration
+import os
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+
+
+from utils.styling import apply_branding, add_footer, add_header
+
+
+# Then in your main code, after apply_branding():
+apply_branding()
+add_header()
+
+
+# And at the end of your page:
+add_footer()
+
+def render_navigation_sidebar():
+    """Navigation sidebar for dashboard"""
+    with st.sidebar:
+        username = st.session_state.get('username', 'User')
+        user_role = st.session_state.get('user_role', 'user')
+        
+        st.markdown(f"👤 **{username}**")
+        st.caption(f"Role: {user_role}")
+        
+        st.markdown("---")
+        st.markdown("### Navigation")
+        
+        if st.button("💬 Chat", use_container_width=True):
+            st.switch_page("01_🏠_Home.py")
+        
+        if st.button("📊 Dashboard", use_container_width=True):
+            st.switch_page("pages/02_📊_Dashboard.py")
+        
+        if st.button("⚙️ Admin Panel", use_container_width=True, disabled=True):
+            pass
+        
+        st.markdown("---")
+        
+        if st.button("🚪 Logout", use_container_width=True):
+            from login import logout
+            logout()
+
 
 def load_styles_safely():
     """Load CSS safely for admin panel"""
@@ -33,6 +76,21 @@ def initialize_admin_session():
         st.session_state.test_questions = []
 
 def main():
+    # Check authentication
+    if not check_authentication():
+        login_page()
+        return
+    
+    # Check if user has admin/superuser role
+    # Restrict to admin/superuser only
+    user_role = st.session_state.get("user_role", "user")
+    if user_role not in ["admin", "superuser"]:
+        st.error("🚫 Access Denied")
+        st.stop()
+
+    # Add sidebar navigation
+    render_navigation_sidebar()
+
     load_styles_safely()
     initialize_admin_session()
     
